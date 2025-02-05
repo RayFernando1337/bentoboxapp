@@ -4,3 +4,6 @@ pysrt==1.1.2
 ffmpeg-python==0.2.0
 deepgram-sdk==2.12.0
 python-dotenv==1.0.1
+pydub==0.25.1
+openai==1.12.0
+groq==0.4.2

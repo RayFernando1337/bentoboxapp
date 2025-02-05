@@ -82,13 +82,8 @@ db.init_app(app)
 with app.app_context():
     db.create_all()
 
-ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'wmv', 'mp3', 'wav'}
-
-# Ensure static directory exists
-os.makedirs('static', exist_ok=True)
-
-# Ensure upload directory exists
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+# Allowed file extensions
+ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'wmv', 'mp3', 'wav', 'm4a', 'aac', 'flac'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -102,77 +97,60 @@ def timedelta_to_srt_time(td):
     milliseconds = td.microseconds // 1000
     return pysrt.SubRipTime(hours=hours, minutes=minutes, seconds=seconds, milliseconds=milliseconds)
 
-def extract_audio(video_path, output_path, progress_callback=None):
-    """Extract audio from video file using ffmpeg with stream copy"""
+async def extract_audio(video_path, audio_path, progress_callback=None):
+    """Extract audio from video file using ffmpeg"""
     try:
-        logging.info(f"Extracting audio stream from {video_path}")
-        
-        # Get video duration for progress calculation
-        duration_cmd = [
-            'ffprobe',
-            '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_path
+        if progress_callback:
+            await progress_callback({
+                'stage': 'extracting_audio',
+                'progress': 10,
+                'text': 'Extracting audio from video...'
+            })
+
+        # Use ffmpeg to extract audio with optimal settings for transcription
+        cmd = [
+            'ffmpeg', '-i', video_path,
+            '-vn',  # Disable video
+            '-acodec', 'pcm_s16le',  # Use WAV format
+            '-ar', '16000',  # 16kHz sample rate
+            '-ac', '1',  # Mono audio
+            '-y',  # Overwrite output file
+            audio_path
         ]
-        duration = float(subprocess.check_output(duration_cmd).decode().strip())
-        
-        # Setup FFmpeg command for fast audio extraction
-        command = [
-            'ffmpeg',
-            '-i', video_path,
-            '-vn',                # No video
-            '-acodec', 'pcm_s16le', # Audio codec
-            '-ar', '16000',        # Sample rate
-            '-ac', '1',            # Mono
-            '-f', 'wav',           # Format
-            '-progress', 'pipe:1',  # Output progress to stdout
-            '-y',                  # Overwrite
-            output_path
-        ]
-        
-        # Start FFmpeg process
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        
-        # Monitor progress
-        time_processed = 0
-        while True:
-            line = process.stdout.readline()
-            if not line:
-                break
-                
-            # Parse progress
-            if line.startswith('out_time_ms='):
-                time_processed = float(line.split('=')[1]) / 1000000  # Convert to seconds
-                if progress_callback:
-                    progress = (time_processed / duration) * 100
-                    progress_callback({
-                        'stage': 'extracting_audio',
-                        'progress': min(progress, 100)
-                    })
-        
-        # Check result
-        process.wait()
+
+        stdout, stderr = await process.communicate()
+
         if process.returncode != 0:
-            error = process.stderr.read()
-            raise Exception(f"FFmpeg error: {error}")
-            
-        if not os.path.exists(output_path):
-            raise Exception("Audio extraction failed: output file not created")
-            
-        logging.info("Audio extraction completed successfully")
-        return True
-        
+            raise Exception(f"FFmpeg error: {stderr.decode()}")
+
+        if progress_callback:
+            await progress_callback({
+                'stage': 'audio_extracted',
+                'progress': 20,
+                'text': 'Audio extraction complete'
+            })
+
+        return audio_path
+
     except Exception as e:
-        logging.error(f"Error during audio extraction: {str(e)}")
-        if os.path.exists(output_path):
-            os.remove(output_path)
+        logging.error(f"Error extracting audio: {str(e)}")
         raise
+
+def cleanup_files(*files):
+    """Clean up temporary files"""
+    for file in files:
+        if file and os.path.exists(file):
+            try:
+                os.remove(file)
+                logging.info(f"Cleaned up file: {file}")
+            except Exception as e:
+                logging.error(f"Error cleaning up file {file}: {str(e)}")
 
 @app.route('/', methods=['GET'])
 def index():
@@ -328,12 +306,9 @@ def upload_file():
         )
         db.session.add(transcript)
         db.session.commit()
-        logging.info(f"Created transcript record with title: {clean_title}")
-
-        # Save uploaded file to temp directory
+        
+        # Save uploaded file
         file.save(temp_path)
-        file_size = os.path.getsize(temp_path)
-        logging.info(f"File saved temporarily: {temp_path} (size: {file_size/1024/1024:.2f} MB)")
         
         # Start transcription process
         def process_file():
@@ -341,7 +316,7 @@ def upload_file():
                 # Create new event loop for this thread
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-
+                
                 async def process_async():
                     async def update_progress(progress_data):
                         """Update transcript progress in database"""
@@ -352,13 +327,12 @@ def upload_file():
                             transcript.content = progress_data['text']
                         db.session.commit()
 
+                    audio_path = None
                     try:
                         # For video files, extract audio first
                         if file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.wmv')):
                             audio_path = os.path.join(temp_dir, f"{title}.wav")
                             logging.info(f"Extracting audio from video file to {audio_path}")
-                            
-                            # Extract audio with progress tracking
                             await extract_audio(temp_path, audio_path, update_progress)
                             input_path = audio_path
                         else:
@@ -382,13 +356,17 @@ def upload_file():
                             transcript.status = 'completed'
                             db.session.commit()
                             logging.info(f"Transcription completed for {clean_title}")
+
                     except Exception as e:
                         logging.error(f"Error in async processing: {str(e)}")
                         transcript.status = 'failed'
                         transcript.error_message = str(e)
                         db.session.commit()
                         raise
-                
+                    finally:
+                        # Clean up temporary files
+                        cleanup_files(temp_path, audio_path)
+
                 try:
                     # Run the async process
                     loop.run_until_complete(process_async())
@@ -403,29 +381,25 @@ def upload_file():
                             loop.close()
                     except Exception as e:
                         logging.error(f"Error closing event loop: {str(e)}")
-                    
-                    # Clean up temporary files
-                    if os.path.exists(temp_path):
-                        try:
-                            os.remove(temp_path)
-                        except Exception as e:
-                            logging.error(f"Error removing temp file: {str(e)}")
+
             except Exception as e:
                 logging.error(f"Error in process_file: {str(e)}")
                 transcript.status = 'failed'
                 transcript.error_message = str(e)
                 db.session.commit()
-        
-        # Start processing in background
-        threading.Thread(target=process_file).start()
+
+        # Start processing in a separate thread
+        thread = threading.Thread(target=process_file)
+        thread.start()
         
         return jsonify({
-            'message': 'File uploaded successfully',
-            'title': clean_title
+            'title': clean_title,
+            'message': 'File uploaded successfully, processing started'
         })
         
     except Exception as e:
-        logging.error(f"Error uploading file: {str(e)}")
+        logging.error(f"Error handling upload: {str(e)}")
+        cleanup_files(temp_path)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/transcript/<int:transcript_id>', methods=['GET'])

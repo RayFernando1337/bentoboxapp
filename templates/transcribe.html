@@ -202,31 +202,9 @@
         }
     }
 
-    let audioProcessor;
-
-    // Initialize audio processor when document loads
-    document.addEventListener('DOMContentLoaded', async () => {
-        try {
-            console.log('Creating AudioProcessor instance...');
-            audioProcessor = new AudioProcessor();
-            console.log('AudioProcessor created successfully');
-        } catch (err) {
-            console.error('Failed to create AudioProcessor:', err);
-            error.textContent = 'Audio processing is not supported in this browser';
-            error.style.display = 'block';
-        }
-    });
-
     async function handleFile(file) {
         console.log('Handling file:', file.name, 'Size:', file.size, 'Type:', file.type);
         
-        if (!audioProcessor) {
-            console.error('AudioProcessor not initialized');
-            error.textContent = 'Audio processor not ready. Please try again.';
-            error.style.display = 'block';
-            return;
-        }
-
         // Reset UI
         error.style.display = 'none';
         document.getElementById('uploadInitial').style.display = 'none';
@@ -236,23 +214,14 @@
         progressBarFill.style.width = '0%';
         
         try {
-            // Process file client-side
-            console.log('Starting audio processing...');
-            progressText.textContent = 'Processing audio...';
-            progressBarFill.style.width = '20%';
-            const processedAudio = await audioProcessor.processFile(file);
-            console.log('Audio processing complete, blob size:', processedAudio.size);
-            
-            // Create FormData with processed audio
+            // Create FormData and upload directly
             console.log('Preparing upload...');
             progressText.textContent = 'Uploading...';
-            progressBarFill.style.width = '40%';
+            progressBarFill.style.width = '20%';
             const formData = new FormData();
-            const newFileName = file.name.replace(/\.[^/.]+$/, '.wav');
-            formData.append('file', processedAudio, newFileName);
-            console.log('Uploading as:', newFileName);
+            formData.append('file', file);
             
-            // Upload processed file
+            // Upload file
             console.log('Starting upload...');
             const response = await fetch('/upload', {
                 method: 'POST',
@@ -272,7 +241,7 @@
             // Start polling with the cleaned title from server
             console.log('Starting transcription polling...');
             progressText.textContent = 'Transcribing...';
-            progressBarFill.style.width = '60%';
+            progressBarFill.style.width = '40%';
             pollWordCount(data.title);
         } catch (err) {
             console.error('Error in handleFile:', err);
