@@ -1,0 +1,545 @@
+{% extends "base.html" %}
+
+{% block content %}
+<!-- Load audio processor -->
+<script src="{{ url_for('static', filename='js/audio-processor.js') }}"></script>
+<!-- Delete Confirmation Modal -->
+<div id="deleteModal" class="modal" style="display: none;">
+    <div class="modal-content">
+        <h3>Stop & Delete Transcript?</h3>
+        <p>This will stop the transcription process if it's running and delete all associated files. This action cannot be undone.</p>
+        <div class="modal-buttons">
+            <button onclick="closeDeleteModal()" class="btn secondary">Cancel</button>
+            <button onclick="confirmDelete()" class="btn danger">Stop & Delete</button>
+        </div>
+    </div>
+</div>
+<script>
+    // Show loading state when page loads
+    document.addEventListener('DOMContentLoaded', function() {
+        const loadingOverlay = document.getElementById('tableLoading');
+        if (loadingOverlay) {
+            loadingOverlay.style.display = 'flex';
+            // Hide loading after content is ready
+            setTimeout(() => {
+                loadingOverlay.style.display = 'none';
+            }, 300); // Small delay to ensure smooth animation
+        }
+    });
+</script>
+
+<div class="card-container">
+    <!-- Upload Card -->
+    <div class="card">
+        <h2>Transcribe Video</h2>
+        <div id="notificationBanner" style="display: none; background-color: #f0f8ff; padding: 10px; margin-bottom: 15px; border-radius: 4px; border: 1px solid #b8daff;">
+            <p style="margin: 0; color: #004085;">You can leave the page and be notified when transcription is done. Enjoy! 🎉</p>
+        </div>
+        <div class="upload-area" id="dropZone">
+            <!-- Initial Upload State -->
+            <div id="uploadInitial">
+                <p>Drag and drop your video file here or click to select</p>
+                <input type="file" id="fileInput" accept=".mp4,.avi,.mov,.wmv,.mp3,.wav" style="display: none;">
+                <button class="btn" onclick="document.getElementById('fileInput').click()">Select File</button>
+            </div>
+            
+            <!-- Processing State -->
+            <div id="uploadProcessing" style="display: none;">
+                <div class="progress-container">
+                    <p class="progress-text">Uploading...</p>
+                    <div class="progress-bar">
+                        <div class="progress-bar-fill" id="progressBarFill" style="width: 0%;"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Success State -->
+            <div id="uploadSuccess" style="display: none;">
+                <div class="success-message">
+                    <span class="material-icons success-icon">check_circle</span>
+                    <p>Transcription Complete!</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Info Card -->
+    <div class="card info-card">
+        <h2>How It Works</h2>
+        <div class="info-content">
+            <p>Upload your video or audio file and we'll convert it to text using advanced AI technology. Perfect for creating subtitles, transcripts, or making your content more accessible.</p>
+            
+            <h3>Supported File Types:</h3>
+            <ul>
+                <li><strong>Video:</strong> MP4, AVI, MOV, WMV</li>
+                <li><strong>Audio:</strong> MP3, WAV</li>
+            </ul>
+            
+            <p class="note">For best results, ensure your audio is clear and the file size is reasonable. Larger files may take longer to process.</p>
+        </div>
+    </div>
+</div>
+
+<div class="error" id="error"></div>
+
+<div class="content-table" style="margin-top: 2rem;" id="transcriptTable">
+    <h2 style="padding: 1rem; margin: 0; color: #002F56;">My Transcriptions</h2>
+    <div class="loading-overlay" id="tableLoading">
+        <div class="loading-spinner"></div>
+        <p>Loading transcripts...</p>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>File Name</th>
+                <th>Word Count</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody id="transcriptTableBody">
+            {% for transcript in transcripts %}
+            <tr>
+                <td>
+                    <div class="filename-cell">
+                        <span class="filename">{{ transcript.title }}</span>
+                        <span class="material-icons edit-icon" onclick="editTitle(this, '{{ transcript.title }}')">edit</span>
+                    </div>
+                </td>
+                <td class="word-count">{{ transcript.word_count }} words</td>
+                <td>{{ transcript.status }}</td>
+                <td style="text-align: right;">
+                    <button onclick="previewTranscript('{{ transcript.title }}')" class="icon-button" {% if transcript.status == 'processing' %}disabled{% endif %}>
+                        <span class="material-icons">visibility</span>
+                        <span class="tooltip">Preview</span>
+                    </button>
+                    <button onclick="startCreating('{{ transcript.title }}')" class="icon-button" {% if transcript.status == 'processing' %}disabled{% endif %}>
+                        <span class="material-icons">edit</span>
+                        <span class="tooltip">Create Content</span>
+                    </button>
+                    <a href="/transcript/{{ transcript.id }}/srt" class="icon-button" download {% if transcript.status == 'processing' %}style="pointer-events: none; opacity: 0.5;"{% endif %}>
+                        <span class="material-icons">download</span>
+                        <span class="tooltip">Download SRT</span>
+                    </a>
+                    <button onclick="showDeleteConfirmation('{{ transcript.id }}')" class="icon-button delete-button">
+                        <span class="material-icons">delete</span>
+                        <span class="tooltip">Stop & Delete</span>
+                    </button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Get UI elements
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const progressBarFill = document.getElementById('progressBarFill');
+    const error = document.getElementById('error');
+    const progressText = document.querySelector('.progress-text');
+    
+    // Initialize UI
+    error.style.display = 'none';
+    document.getElementById('uploadInitial').style.display = 'block';
+    document.getElementById('uploadProcessing').style.display = 'none';
+    document.getElementById('uploadSuccess').style.display = 'none';
+    progressBarFill.style.width = '0%';
+    const previewWindow = document.getElementById('previewWindow');
+
+    // Handle drag and drop events
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.style.backgroundColor = '#fafafa';
+        dropZone.style.borderColor = '#C1A7D0';
+    });
+
+    dropZone.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        dropZone.style.backgroundColor = 'white';
+        dropZone.style.borderColor = '#D2BFDD';
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropZone.style.backgroundColor = 'white';
+        dropZone.style.borderColor = '#D2BFDD';
+        
+        const file = e.dataTransfer.files[0];
+        if (file) {
+            handleFile(file);
+        }
+    });
+
+    // Handle file selection
+    fileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            handleFile(file);
+        }
+    });
+
+    // Request notification permission on page load
+    document.addEventListener('DOMContentLoaded', function() {
+        if (Notification.permission !== 'granted' && Notification.permission !== 'denied') {
+            Notification.requestPermission();
+        }
+    });
+
+    function showNotification(title, body) {
+        if (Notification.permission === 'granted') {
+            const notification = new Notification(title, {
+                body: body,
+                icon: '/static/logo.svg'
+            });
+            notification.onclick = function() {
+                window.focus();
+                notification.close();
+            };
+        }
+    }
+
+    let audioProcessor;
+
+    // Initialize audio processor when document loads
+    document.addEventListener('DOMContentLoaded', async () => {
+        try {
+            console.log('Creating AudioProcessor instance...');
+            audioProcessor = new AudioProcessor();
+            console.log('AudioProcessor created successfully');
+        } catch (err) {
+            console.error('Failed to create AudioProcessor:', err);
+            error.textContent = 'Audio processing is not supported in this browser';
+            error.style.display = 'block';
+        }
+    });
+
+    async function handleFile(file) {
+        console.log('Handling file:', file.name, 'Size:', file.size, 'Type:', file.type);
+        
+        if (!audioProcessor) {
+            console.error('AudioProcessor not initialized');
+            error.textContent = 'Audio processor not ready. Please try again.';
+            error.style.display = 'block';
+            return;
+        }
+
+        // Reset UI
+        error.style.display = 'none';
+        document.getElementById('uploadInitial').style.display = 'none';
+        document.getElementById('uploadProcessing').style.display = 'block';
+        document.getElementById('uploadSuccess').style.display = 'none';
+        document.getElementById('notificationBanner').style.display = 'block';
+        progressBarFill.style.width = '0%';
+        
+        try {
+            // Process file client-side
+            console.log('Starting audio processing...');
+            progressText.textContent = 'Processing audio...';
+            progressBarFill.style.width = '20%';
+            const processedAudio = await audioProcessor.processFile(file);
+            console.log('Audio processing complete, blob size:', processedAudio.size);
+            
+            // Create FormData with processed audio
+            console.log('Preparing upload...');
+            progressText.textContent = 'Uploading...';
+            progressBarFill.style.width = '40%';
+            const formData = new FormData();
+            const newFileName = file.name.replace(/\.[^/.]+$/, '.wav');
+            formData.append('file', processedAudio, newFileName);
+            console.log('Uploading as:', newFileName);
+            
+            // Upload processed file
+            console.log('Starting upload...');
+            const response = await fetch('/upload', {
+                method: 'POST',
+                body: formData
+            });
+            
+            console.log('Upload complete, parsing response...');
+            const data = await response.json();
+            if (data.error) throw new Error(data.error);
+            
+            console.log('Upload successful:', data);
+            
+            // Store transcription info in localStorage
+            localStorage.setItem('currentTranscription', data.title);
+            localStorage.setItem('transcriptionStartTime', Date.now());
+            
+            // Start polling with the cleaned title from server
+            console.log('Starting transcription polling...');
+            progressText.textContent = 'Transcribing...';
+            progressBarFill.style.width = '60%';
+            pollWordCount(data.title);
+        } catch (err) {
+            console.error('Error in handleFile:', err);
+            resetUploadState();
+            error.textContent = err.message;
+            error.style.display = 'block';
+        }
+    }
+
+    function saveTranscript(text, chunks) {
+        const formData = new FormData();
+        formData.append('text', text);
+        formData.append('chunks', JSON.stringify(chunks));
+        formData.append('filename', fileInput.files[0].name);
+        
+        fetch('/save_transcript', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) throw new Error(data.error);
+            
+            // Show success state
+            document.getElementById('uploadProcessing').style.display = 'none';
+            document.getElementById('uploadSuccess').style.display = 'block';
+            
+            // Reset after 3 seconds
+            setTimeout(() => {
+                resetUploadState();
+                window.location.reload();
+            }, 3000);
+        })
+        .catch(err => {
+            resetUploadState();
+            error.textContent = err.message;
+            error.style.display = 'block';
+        });
+    }
+
+    // Check for pending transcription on page load
+    document.addEventListener('DOMContentLoaded', function() {
+        const pendingTitle = localStorage.getItem('currentTranscription');
+        if (pendingTitle) {
+            // Show processing UI
+            document.getElementById('uploadInitial').style.display = 'none';
+            document.getElementById('uploadProcessing').style.display = 'block';
+            document.getElementById('notificationBanner').style.display = 'block';
+            progressText.textContent = 'Processing...';
+            progressBarFill.style.width = '30%';
+            pollWordCount(pendingTitle);
+        }
+    });
+
+    function pollWordCount(title) {
+        let dots = '';
+        let startTime = parseInt(localStorage.getItem('transcriptionStartTime') || Date.now());
+        let retries = 0;
+        const maxRetries = 7200; // 2 hours
+        
+        const poll = () => {
+            fetch(`/word_count/${encodeURIComponent(title)}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'completed') {
+                        // Update progress to 100%
+                        progressBarFill.style.width = '100%';
+                        progressText.textContent = 'Transcription Complete!';
+                        
+                        // Show success message
+                        document.getElementById('uploadProcessing').style.display = 'none';
+                        document.getElementById('uploadSuccess').style.display = 'block';
+                        document.getElementById('notificationBanner').style.display = 'none';
+                        
+                        // Clear pending transcription
+                        localStorage.removeItem('currentTranscription');
+                        localStorage.removeItem('transcriptionStartTime');
+                        
+                        // Show notification
+                        showNotification('Transcription Complete', `Your video "${title}" has been transcribed successfully!`);
+                        
+                        // Reset after 3 seconds and refresh
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 3000);
+                    } else if (data.status === 'failed' || data.error) {
+                        // Show error
+                        resetUploadState();
+                        error.textContent = data.error || 'Transcription failed';
+                        error.style.display = 'block';
+                        localStorage.removeItem('currentTranscription');
+                        localStorage.removeItem('transcriptionStartTime');
+                    } else if (data.status === 'processing') {
+                        // Calculate progress based on elapsed time
+                        const elapsedTime = (Date.now() - startTime) / 1000; // seconds
+                        const estimatedDuration = data.estimated_duration || 7200; // 2 hours default
+                        const progressPercent = Math.min(90, (elapsedTime / estimatedDuration) * 100);
+                        
+                        // Update UI
+                        dots = dots.length >= 3 ? '' : dots + '.';
+                        const remainingMins = Math.max(0, Math.round((estimatedDuration - elapsedTime) / 60));
+                        progressText.textContent = `Transcribing${dots} (${remainingMins} mins remaining)`;
+                        progressBarFill.style.width = progressPercent + '%';
+                        
+                        // Save progress
+                        localStorage.setItem('transcriptionProgress', progressPercent);
+                        
+                        // Continue polling
+                        if (retries < maxRetries) {
+                            retries++;
+                            setTimeout(poll, 1000);
+                        } else {
+                            throw new Error('Transcription timed out after 2 hours');
+                        }
+                    } else {
+                        throw new Error('Unknown transcription status: ' + data.status);
+                    }
+                })
+                .catch(err => {
+                    resetUploadState();
+                    error.textContent = err.message;
+                    error.style.display = 'block';
+                });
+        };
+        
+        poll();
+    }
+
+    function resetUploadState() {
+        error.style.display = 'none';
+        document.getElementById('uploadInitial').style.display = 'block';
+        document.getElementById('uploadProcessing').style.display = 'none';
+        document.getElementById('uploadSuccess').style.display = 'none';
+        progressBarFill.style.width = '0%';
+        fileInput.value = '';
+    }
+
+    function previewTranscript(title) {
+        fetch(`/preview_transcript/${encodeURIComponent(title)}`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                document.getElementById('previewContent').innerHTML = data.content;
+                document.getElementById('previewModal').style.display = 'block';
+            })
+            .catch(err => {
+                alert('Error loading preview: ' + err.message);
+            });
+    }
+
+    function closePreviewModal() {
+        document.getElementById('previewModal').style.display = 'none';
+    }
+
+    function showDeleteConfirmation(id) {
+        window.transcriptToDelete = id;
+        document.getElementById('deleteModal').style.display = 'block';
+    }
+
+    function closeDeleteModal() {
+        document.getElementById('deleteModal').style.display = 'none';
+        window.transcriptToDelete = null;
+    }
+
+    function confirmDelete() {
+        const id = window.transcriptToDelete;
+        if (!id) return;
+
+        fetch(`/transcript/${id}`, {
+            method: 'DELETE'
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(data => {
+                    throw new Error(data.error || 'Delete failed');
+                });
+            }
+            window.location.reload();
+        })
+        .catch(err => {
+            alert('Error deleting transcript: ' + err.message);
+        })
+        .finally(() => {
+            closeDeleteModal();
+        });
+    }
+
+    function editTitle(element, oldTitle) {
+        const cell = element.closest('.filename-cell');
+        const filenameSpan = cell.querySelector('.filename');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = oldTitle;
+        input.style.width = '200px';
+        input.style.padding = '4px';
+        input.style.border = '1px solid #D2BFDD';
+        input.style.borderRadius = '4px';
+        input.style.marginRight = '8px';
+
+        const saveButton = document.createElement('button');
+        saveButton.textContent = 'Save';
+        saveButton.className = 'btn';
+        saveButton.style.padding = '4px 8px';
+        saveButton.style.fontSize = '12px';
+        saveButton.style.height = 'auto';
+
+        const cancelButton = document.createElement('button');
+        cancelButton.textContent = 'Cancel';
+        cancelButton.className = 'btn';
+        cancelButton.style.padding = '4px 8px';
+        cancelButton.style.fontSize = '12px';
+        cancelButton.style.height = 'auto';
+        cancelButton.style.marginLeft = '4px';
+
+        function restoreOriginal() {
+            cell.innerHTML = `
+                <span class="filename">${oldTitle}</span>
+                <span class="material-icons edit-icon" onclick="editTitle(this, '${oldTitle}')">edit</span>
+            `;
+        }
+
+        saveButton.onclick = () => {
+            const newTitle = input.value.trim();
+            if (!newTitle) {
+                alert('Title cannot be empty');
+                return;
+            }
+
+            fetch('/rename_transcript', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    old_title: oldTitle,
+                    new_title: newTitle
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(data => {
+                        throw new Error(data.error || 'Rename failed');
+                    });
+                }
+                window.location.reload();
+            })
+            .catch(err => {
+                alert('Error renaming transcript: ' + err.message);
+                restoreOriginal();
+            });
+        };
+
+        cancelButton.onclick = restoreOriginal;
+
+        cell.innerHTML = '';
+        cell.appendChild(input);
+        cell.appendChild(saveButton);
+        cell.appendChild(cancelButton);
+        input.focus();
+        input.select();
+    }
+
+    function startCreating(title) {
+        // Redirect to create page with the transcript title
+        window.location.href = `/create?transcript=${encodeURIComponent(title)}`;
+    }
+</script>
+{% endblock %}
