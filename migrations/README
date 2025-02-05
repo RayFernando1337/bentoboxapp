@@ -1,1 +1,63 @@
-Generic single-database configuration.
+# Database Migrations
+
+This directory contains database migration scripts for the BentoBox Transcription Service.
+
+## Migration Management
+
+The application uses Flask-SQLAlchemy for database management and Alembic for migrations.
+
+### Structure
+
+- `versions/`: Contains individual migration scripts
+- `env.py`: Migration environment configuration
+- `script.py.mako`: Template for new migration scripts
+
+### Commands
+
+1. **Initialize Migrations**:
+
+   ```bash
+   flask db init
+   ```
+
+2. **Create New Migration**:
+
+   ```bash
+   flask db migrate -m "description of changes"
+   ```
+
+3. **Apply Migrations**:
+
+   ```bash
+   flask db upgrade
+   ```
+
+4. **Rollback Migration**:
+   ```bash
+   flask db downgrade
+   ```
+
+### Current Schema
+
+The main table is `transcripts` with the following columns:
+
+- `id`: Primary key
+- `title`: Unique transcript title
+- `content`: Transcript text
+- `status`: Processing status
+- `progress`: Processing progress
+- `error`: Error message if any
+- `word_count`: Number of words
+- `duration`: Audio duration
+- `language`: Transcript language
+- `segments`: JSON segments for SRT
+- `created_at`: Creation timestamp
+- `updated_at`: Last update timestamp
+
+### Best Practices
+
+1. Always backup database before migrations
+2. Test migrations in development first
+3. Review migration scripts before applying
+4. Keep migrations reversible when possible
+5. Document significant schema changes
