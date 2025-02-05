@@ -1,10 +1,25 @@
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import TypeDecorator, TEXT
+import json
 from sqlalchemy.ext.hybrid import hybrid_property
 
 db = SQLAlchemy()
+
+class JSONType(TypeDecorator):
+    """Enables JSON storage by encoding and decoding on the fly."""
+    impl = TEXT
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return json.dumps(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return json.loads(value)
 
 class Transcript(db.Model):
     """Model for storing transcription data"""
@@ -24,7 +39,7 @@ class Transcript(db.Model):
     word_count = db.Column(db.Integer, default=0)
     duration = db.Column(db.Float, default=0)
     language = db.Column(db.String(10), default='en')
-    segments = db.Column(JSONB, default=list)
+    segments = db.Column(JSONType, default=list)
     
     # Timestamps
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)

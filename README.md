@@ -39,48 +39,95 @@ A modern web application for transcribing audio and video files using Groq's Whi
 
 ## Setup
 
-1. **Environment Setup**:
+1. **Clone and Navigate**:
 
    ```bash
-   # Create and activate virtual environment
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   git clone <repository-url>
+   cd bentoboxapp
    ```
 
-2. **Install Dependencies**:
+2. **Environment Setup**:
 
    ```bash
+   # Create and activate conda environment
+   conda create -n bentoboxapp python=3.12
+   conda activate bentoboxapp
+   ```
+
+3. **Install Dependencies**:
+
+   ```bash
+   # Install FFmpeg first
+   conda install -c conda-forge ffmpeg
+
+   # Install Python packages
    pip install -r requirements.txt
    ```
 
-3. **Environment Variables**:
-   Create a `.env` file with the following:
+4. **Environment Configuration**:
+   Create a `.env` file in the project root:
 
-   ```
+   ```env
    GROQ_API_KEY=your_groq_api_key
    OPENAI_API_KEY=your_openai_api_key
-   FLASK_SECRET_KEY=your_secret_key
-   DATABASE_URL=your_database_url
+   FLASK_SECRET_KEY=dev-secret-key
+   SQLALCHEMY_DATABASE_URI=sqlite:///bentobox.db
+   FLASK_APP=app.py
    ```
 
-4. **Database Setup**:
+   Replace `your_groq_api_key` and `your_openai_api_key` with your actual API keys.
+
+5. **Database Setup**:
 
    ```bash
-   # The application will automatically create tables on first run
-   python app.py
+   # Make sure you're in the project directory and your environment is activated
+   cd /path/to/bentoboxapp
+   conda activate bentoboxapp
+
+   # Install dependencies (if not already done)
+   pip install -r requirements.txt
+
+   # Set the Flask application
+   export FLASK_APP=app.py
+
+   # Initialize the database
+   flask db init
+   flask db migrate -m "initial migration"
+   flask db upgrade
    ```
 
-5. **Run the Application**:
+   If you see "No such command 'db'", make sure you've installed all requirements and activated your environment.
+
+6. **Run the Application**:
    ```bash
-   python app.py
+   # Development server
+   flask run --port 5001
    ```
    The application will be available at http://localhost:5001
 
+## Troubleshooting
+
+- **Database Issues**:
+
+  - Ensure the `.env` file exists and contains `SQLALCHEMY_DATABASE_URI`
+  - Check that `FLASK_APP` is set correctly: `export FLASK_APP=app.py`
+  - Verify the database directory is writable
+
+- **FFmpeg Issues**:
+
+  - Confirm FFmpeg installation: `ffmpeg -version`
+  - If missing, reinstall: `conda install -c conda-forge ffmpeg`
+
+- **API Keys**:
+  - Verify both Groq and OpenAI API keys are set in `.env`
+  - Test API keys validity before running the application
+
 ## System Requirements
 
-- Python 3.8 or higher
-- FFmpeg (for audio extraction)
-- PostgreSQL database
+- Python 3.12
+- Conda package manager
+- FFmpeg (installed via conda-forge)
+- SQLite (for local development) or PostgreSQL (for production)
 - Sufficient disk space for temporary file processing
 
 ## API Endpoints

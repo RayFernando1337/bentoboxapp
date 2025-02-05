@@ -5,6 +5,7 @@ from pathlib import Path
 from flask import Flask
 from dotenv import load_dotenv
 from models import db
+from flask_migrate import Migrate
 from routes import register_blueprints
 from routes.errors import register_error_handlers
 from services.file_handler import FileHandler
@@ -31,7 +32,7 @@ def create_app(config=None):
         UPLOAD_FOLDER=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads'),
         MAX_CONTENT_LENGTH=8000 * 1024 * 1024,  # 8GB max file size
         SECRET_KEY=os.getenv('FLASK_SECRET_KEY', 'dev'),
-        SQLALCHEMY_DATABASE_URI=os.getenv('DATABASE_URL'),
+        SQLALCHEMY_DATABASE_URI=os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///bentobox.db'),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SQLALCHEMY_ENGINE_OPTIONS={
             'pool_size': 5,
@@ -47,6 +48,7 @@ def create_app(config=None):
     
     # Initialize extensions
     db.init_app(app)
+    migrate = Migrate(app, db)  # Initialize Flask-Migrate
     
     # Ensure upload directories exist
     upload_dir = Path(app.config['UPLOAD_FOLDER'])
