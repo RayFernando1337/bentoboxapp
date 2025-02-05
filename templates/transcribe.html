@@ -15,6 +15,25 @@
     </div>
 </div>
 <script>
+    // Constants matching backend TranscriptStatus
+    const TranscriptStatus = {
+        PROCESSING: 'processing',
+        COMPLETED: 'completed',
+        FAILED: 'failed',
+        CHUNKING: 'processing_chunking',
+        TRANSCRIBING: 'processing_transcribing',
+        EXTRACTING_AUDIO: 'processing_extracting_audio',
+        UPLOADING: 'processing_uploading'
+    };
+
+    // Progress stages and their percentages
+    const ProgressStages = {
+        UPLOAD: { start: 0, end: 20 },
+        AUDIO_EXTRACT: { start: 20, end: 40 },
+        CHUNKING: { start: 40, end: 60 },
+        TRANSCRIPTION: { start: 60, end: 100 }
+    };
+
     // Show loading state when page loads
     document.addEventListener('DOMContentLoaded', function() {
         const loadingOverlay = document.getElementById('tableLoading');
@@ -25,7 +44,329 @@
                 loadingOverlay.style.display = 'none';
             }, 300); // Small delay to ensure smooth animation
         }
+
+        // Check for pending transcription
+        const pendingTitle = localStorage.getItem('currentTranscription');
+        if (pendingTitle) {
+            // Show processing UI
+            document.getElementById('uploadInitial').style.display = 'none';
+            document.getElementById('uploadProcessing').style.display = 'block';
+            document.getElementById('notificationBanner').style.display = 'block';
+            progressText.textContent = 'Processing...';
+            progressBarFill.style.width = '30%';
+            pollWordCount(pendingTitle);
+        }
     });
+
+    async function handleFile(file) {
+        console.log('Handling file:', file.name, 'Size:', file.size, 'Type:', file.type);
+        
+        // Reset UI
+        error.style.display = 'none';
+        document.getElementById('uploadInitial').style.display = 'none';
+        document.getElementById('uploadProcessing').style.display = 'block';
+        document.getElementById('uploadSuccess').style.display = 'none';
+        document.getElementById('notificationBanner').style.display = 'block';
+        progressBarFill.style.width = '0%';
+        
+        try {
+            // Create FormData and upload directly
+            console.log('Preparing upload...');
+            progressText.textContent = 'Uploading...';
+            progressBarFill.style.width = `${ProgressStages.UPLOAD.start}%`;
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            // Upload file
+            console.log('Starting upload...');
+            const response = await fetch('/upload', {
+                method: 'POST',
+                body: formData
+            });
+            
+            console.log('Upload complete, parsing response...');
+            const result = await response.json();
+            
+            if (!result.success) {
+                throw new Error(result.error || 'Upload failed');
+            }
+            
+            const data = result.data;
+            console.log('Upload successful:', data);
+            
+            // Store transcription info in localStorage
+            localStorage.setItem('currentTranscription', data.title);
+            localStorage.setItem('transcriptionStartTime', Date.now());
+            
+            // Start polling with the cleaned title from server
+            console.log('Starting transcription polling...');
+            progressText.textContent = 'Processing...';
+            progressBarFill.style.width = `${ProgressStages.AUDIO_EXTRACT.start}%`;
+            pollWordCount(data.title);
+        } catch (err) {
+            console.error('Error in handleFile:', err);
+            resetUploadState();
+            error.textContent = err.message;
+            error.style.display = 'block';
+        }
+    }
+
+    function pollWordCount(title) {
+        let dots = '';
+        let startTime = parseInt(localStorage.getItem('transcriptionStartTime') || Date.now());
+        let retries = 0;
+        const maxRetries = 7200; // 2 hours
+        
+        const poll = () => {
+            fetch(`/word_count/${encodeURIComponent(title)}`)
+                .then(response => response.json())
+                .then(result => {
+                    if (!result.success) {
+                        throw new Error(result.error);
+                    }
+
+                    const data = result.data;
+                    
+                    if (data.status === TranscriptStatus.COMPLETED) {
+                        // Update progress to 100%
+                        progressBarFill.style.width = '100%';
+                        progressText.textContent = 'Transcription Complete!';
+                        
+                        // Show success message
+                        document.getElementById('uploadProcessing').style.display = 'none';
+                        document.getElementById('uploadSuccess').style.display = 'block';
+                        document.getElementById('notificationBanner').style.display = 'none';
+                        
+                        // Clear pending transcription
+                        localStorage.removeItem('currentTranscription');
+                        localStorage.removeItem('transcriptionStartTime');
+                        
+                        // Show notification
+                        showNotification('Transcription Complete', `Your file "${title}" has been transcribed successfully!`);
+                        
+                        // Reset after 3 seconds and refresh
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 3000);
+                    } else if (data.status === TranscriptStatus.FAILED) {
+                        // Show error
+                        resetUploadState();
+                        error.textContent = data.error || 'Transcription failed';
+                        error.style.display = 'block';
+                        localStorage.removeItem('currentTranscription');
+                        localStorage.removeItem('transcriptionStartTime');
+                    } else if (data.status.startsWith(TranscriptStatus.PROCESSING)) {
+                        // Calculate progress based on status and elapsed time
+                        let progressPercent = ProgressStages.UPLOAD.end;
+                        
+                        if (data.status.includes('extracting_audio')) {
+                            progressPercent = calculateProgress(
+                                ProgressStages.AUDIO_EXTRACT.start,
+                                ProgressStages.AUDIO_EXTRACT.end,
+                                data.progress
+                            );
+                        } else if (data.status.includes('chunking')) {
+                            progressPercent = calculateProgress(
+                                ProgressStages.CHUNKING.start,
+                                ProgressStages.CHUNKING.end,
+                                data.progress
+                            );
+                        } else {
+                            // Calculate transcription progress
+                            const elapsedTime = (Date.now() - startTime) / 1000; // seconds
+                            const estimatedDuration = data.estimated_duration || 7200; // 2 hours default
+                            const transcriptionProgress = Math.min(100, (elapsedTime / estimatedDuration) * 100);
+                            
+                            progressPercent = calculateProgress(
+                                ProgressStages.TRANSCRIPTION.start,
+                                ProgressStages.TRANSCRIPTION.end,
+                                transcriptionProgress
+                            );
+                        }
+                        
+                        // Update UI
+                        dots = dots.length >= 3 ? '' : dots + '.';
+                        const remainingMins = Math.max(0, Math.round((data.estimated_duration - ((Date.now() - startTime) / 1000)) / 60));
+                        progressText.textContent = `${getStatusMessage(data.status)}${dots} (${remainingMins} mins remaining)`;
+                        progressBarFill.style.width = `${progressPercent}%`;
+                        
+                        // Continue polling
+                        if (retries < maxRetries) {
+                            retries++;
+                            setTimeout(poll, 1000);
+                        } else {
+                            throw new Error('Transcription timed out after 2 hours');
+                        }
+                    } else {
+                        throw new Error('Unknown transcription status: ' + data.status);
+                    }
+                })
+                .catch(err => {
+                    resetUploadState();
+                    error.textContent = err.message;
+                    error.style.display = 'block';
+                });
+        };
+        
+        poll();
+    }
+
+    function calculateProgress(start, end, progress) {
+        return start + ((end - start) * (progress / 100));
+    }
+
+    function getStatusMessage(status) {
+        if (status.includes('extracting_audio')) {
+            return 'Extracting audio';
+        } else if (status.includes('chunking')) {
+            return 'Processing audio';
+        } else if (status.includes('transcribing')) {
+            return 'Transcribing';
+        } else {
+            return 'Processing';
+        }
+    }
+
+    function resetUploadState() {
+        error.style.display = 'none';
+        document.getElementById('uploadInitial').style.display = 'block';
+        document.getElementById('uploadProcessing').style.display = 'none';
+        document.getElementById('uploadSuccess').style.display = 'none';
+        progressBarFill.style.width = '0%';
+        fileInput.value = '';
+    }
+
+    function previewTranscript(title) {
+        fetch(`/preview_transcript/${encodeURIComponent(title)}`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                document.getElementById('previewContent').innerHTML = data.content;
+                document.getElementById('previewModal').style.display = 'block';
+            })
+            .catch(err => {
+                alert('Error loading preview: ' + err.message);
+            });
+    }
+
+    function closePreviewModal() {
+        document.getElementById('previewModal').style.display = 'none';
+    }
+
+    function showDeleteConfirmation(id) {
+        window.transcriptToDelete = id;
+        document.getElementById('deleteModal').style.display = 'block';
+    }
+
+    function closeDeleteModal() {
+        document.getElementById('deleteModal').style.display = 'none';
+        window.transcriptToDelete = null;
+    }
+
+    function confirmDelete() {
+        const id = window.transcriptToDelete;
+        if (!id) return;
+
+        fetch(`/transcript/${id}`, {
+            method: 'DELETE'
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(data => {
+                    throw new Error(data.error || 'Delete failed');
+                });
+            }
+            window.location.reload();
+        })
+        .catch(err => {
+            alert('Error deleting transcript: ' + err.message);
+        })
+        .finally(() => {
+            closeDeleteModal();
+        });
+    }
+
+    function editTitle(element, oldTitle) {
+        const cell = element.closest('.filename-cell');
+        const filenameSpan = cell.querySelector('.filename');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = oldTitle;
+        input.style.width = '200px';
+        input.style.padding = '4px';
+        input.style.border = '1px solid #D2BFDD';
+        input.style.borderRadius = '4px';
+        input.style.marginRight = '8px';
+
+        const saveButton = document.createElement('button');
+        saveButton.textContent = 'Save';
+        saveButton.className = 'btn';
+        saveButton.style.padding = '4px 8px';
+        saveButton.style.fontSize = '12px';
+        saveButton.style.height = 'auto';
+
+        const cancelButton = document.createElement('button');
+        cancelButton.textContent = 'Cancel';
+        cancelButton.className = 'btn';
+        cancelButton.style.padding = '4px 8px';
+        cancelButton.style.fontSize = '12px';
+        cancelButton.style.height = 'auto';
+        cancelButton.style.marginLeft = '4px';
+
+        function restoreOriginal() {
+            cell.innerHTML = `
+                <span class="filename">${oldTitle}</span>
+                <span class="material-icons edit-icon" onclick="editTitle(this, '${oldTitle}')">edit</span>
+            `;
+        }
+
+        saveButton.onclick = () => {
+            const newTitle = input.value.trim();
+            if (!newTitle) {
+                alert('Title cannot be empty');
+                return;
+            }
+
+            fetch('/rename_transcript', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    old_title: oldTitle,
+                    new_title: newTitle
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(data => {
+                        throw new Error(data.error || 'Rename failed');
+                    });
+                }
+                window.location.reload();
+            })
+            .catch(err => {
+                alert('Error renaming transcript: ' + err.message);
+                restoreOriginal();
+            });
+        };
+
+        cancelButton.onclick = restoreOriginal;
+
+        cell.innerHTML = '';
+        cell.appendChild(input);
+        cell.appendChild(saveButton);
+        cell.appendChild(cancelButton);
+        input.focus();
+        input.select();
+    }
+
+    function startCreating(title) {
+        // Redirect to create page with the transcript title
+        window.location.href = `/create?transcript=${encodeURIComponent(title)}`;
+    }
 </script>
 
 <div class="card-container">
@@ -200,315 +541,6 @@
                 notification.close();
             };
         }
-    }
-
-    async function handleFile(file) {
-        console.log('Handling file:', file.name, 'Size:', file.size, 'Type:', file.type);
-        
-        // Reset UI
-        error.style.display = 'none';
-        document.getElementById('uploadInitial').style.display = 'none';
-        document.getElementById('uploadProcessing').style.display = 'block';
-        document.getElementById('uploadSuccess').style.display = 'none';
-        document.getElementById('notificationBanner').style.display = 'block';
-        progressBarFill.style.width = '0%';
-        
-        try {
-            // Create FormData and upload directly
-            console.log('Preparing upload...');
-            progressText.textContent = 'Uploading...';
-            progressBarFill.style.width = '20%';
-            const formData = new FormData();
-            formData.append('file', file);
-            
-            // Upload file
-            console.log('Starting upload...');
-            const response = await fetch('/upload', {
-                method: 'POST',
-                body: formData
-            });
-            
-            console.log('Upload complete, parsing response...');
-            const data = await response.json();
-            if (data.error) throw new Error(data.error);
-            
-            console.log('Upload successful:', data);
-            
-            // Store transcription info in localStorage
-            localStorage.setItem('currentTranscription', data.title);
-            localStorage.setItem('transcriptionStartTime', Date.now());
-            
-            // Start polling with the cleaned title from server
-            console.log('Starting transcription polling...');
-            progressText.textContent = 'Transcribing...';
-            progressBarFill.style.width = '40%';
-            pollWordCount(data.title);
-        } catch (err) {
-            console.error('Error in handleFile:', err);
-            resetUploadState();
-            error.textContent = err.message;
-            error.style.display = 'block';
-        }
-    }
-
-    function saveTranscript(text, chunks) {
-        const formData = new FormData();
-        formData.append('text', text);
-        formData.append('chunks', JSON.stringify(chunks));
-        formData.append('filename', fileInput.files[0].name);
-        
-        fetch('/save_transcript', {
-            method: 'POST',
-            body: formData
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.error) throw new Error(data.error);
-            
-            // Show success state
-            document.getElementById('uploadProcessing').style.display = 'none';
-            document.getElementById('uploadSuccess').style.display = 'block';
-            
-            // Reset after 3 seconds
-            setTimeout(() => {
-                resetUploadState();
-                window.location.reload();
-            }, 3000);
-        })
-        .catch(err => {
-            resetUploadState();
-            error.textContent = err.message;
-            error.style.display = 'block';
-        });
-    }
-
-    // Check for pending transcription on page load
-    document.addEventListener('DOMContentLoaded', function() {
-        const pendingTitle = localStorage.getItem('currentTranscription');
-        if (pendingTitle) {
-            // Show processing UI
-            document.getElementById('uploadInitial').style.display = 'none';
-            document.getElementById('uploadProcessing').style.display = 'block';
-            document.getElementById('notificationBanner').style.display = 'block';
-            progressText.textContent = 'Processing...';
-            progressBarFill.style.width = '30%';
-            pollWordCount(pendingTitle);
-        }
-    });
-
-    function pollWordCount(title) {
-        let dots = '';
-        let startTime = parseInt(localStorage.getItem('transcriptionStartTime') || Date.now());
-        let retries = 0;
-        const maxRetries = 7200; // 2 hours
-        
-        const poll = () => {
-            fetch(`/word_count/${encodeURIComponent(title)}`)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'completed') {
-                        // Update progress to 100%
-                        progressBarFill.style.width = '100%';
-                        progressText.textContent = 'Transcription Complete!';
-                        
-                        // Show success message
-                        document.getElementById('uploadProcessing').style.display = 'none';
-                        document.getElementById('uploadSuccess').style.display = 'block';
-                        document.getElementById('notificationBanner').style.display = 'none';
-                        
-                        // Clear pending transcription
-                        localStorage.removeItem('currentTranscription');
-                        localStorage.removeItem('transcriptionStartTime');
-                        
-                        // Show notification
-                        showNotification('Transcription Complete', `Your video "${title}" has been transcribed successfully!`);
-                        
-                        // Reset after 3 seconds and refresh
-                        setTimeout(() => {
-                            window.location.reload();
-                        }, 3000);
-                    } else if (data.status === 'failed' || data.error) {
-                        // Show error
-                        resetUploadState();
-                        error.textContent = data.error || 'Transcription failed';
-                        error.style.display = 'block';
-                        localStorage.removeItem('currentTranscription');
-                        localStorage.removeItem('transcriptionStartTime');
-                    } else if (data.status === 'processing') {
-                        // Calculate progress based on elapsed time
-                        const elapsedTime = (Date.now() - startTime) / 1000; // seconds
-                        const estimatedDuration = data.estimated_duration || 7200; // 2 hours default
-                        const progressPercent = Math.min(90, (elapsedTime / estimatedDuration) * 100);
-                        
-                        // Update UI
-                        dots = dots.length >= 3 ? '' : dots + '.';
-                        const remainingMins = Math.max(0, Math.round((estimatedDuration - elapsedTime) / 60));
-                        progressText.textContent = `Transcribing${dots} (${remainingMins} mins remaining)`;
-                        progressBarFill.style.width = progressPercent + '%';
-                        
-                        // Save progress
-                        localStorage.setItem('transcriptionProgress', progressPercent);
-                        
-                        // Continue polling
-                        if (retries < maxRetries) {
-                            retries++;
-                            setTimeout(poll, 1000);
-                        } else {
-                            throw new Error('Transcription timed out after 2 hours');
-                        }
-                    } else {
-                        throw new Error('Unknown transcription status: ' + data.status);
-                    }
-                })
-                .catch(err => {
-                    resetUploadState();
-                    error.textContent = err.message;
-                    error.style.display = 'block';
-                });
-        };
-        
-        poll();
-    }
-
-    function resetUploadState() {
-        error.style.display = 'none';
-        document.getElementById('uploadInitial').style.display = 'block';
-        document.getElementById('uploadProcessing').style.display = 'none';
-        document.getElementById('uploadSuccess').style.display = 'none';
-        progressBarFill.style.width = '0%';
-        fileInput.value = '';
-    }
-
-    function previewTranscript(title) {
-        fetch(`/preview_transcript/${encodeURIComponent(title)}`)
-            .then(response => response.json())
-            .then(data => {
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-                document.getElementById('previewContent').innerHTML = data.content;
-                document.getElementById('previewModal').style.display = 'block';
-            })
-            .catch(err => {
-                alert('Error loading preview: ' + err.message);
-            });
-    }
-
-    function closePreviewModal() {
-        document.getElementById('previewModal').style.display = 'none';
-    }
-
-    function showDeleteConfirmation(id) {
-        window.transcriptToDelete = id;
-        document.getElementById('deleteModal').style.display = 'block';
-    }
-
-    function closeDeleteModal() {
-        document.getElementById('deleteModal').style.display = 'none';
-        window.transcriptToDelete = null;
-    }
-
-    function confirmDelete() {
-        const id = window.transcriptToDelete;
-        if (!id) return;
-
-        fetch(`/transcript/${id}`, {
-            method: 'DELETE'
-        })
-        .then(response => {
-            if (!response.ok) {
-                return response.json().then(data => {
-                    throw new Error(data.error || 'Delete failed');
-                });
-            }
-            window.location.reload();
-        })
-        .catch(err => {
-            alert('Error deleting transcript: ' + err.message);
-        })
-        .finally(() => {
-            closeDeleteModal();
-        });
-    }
-
-    function editTitle(element, oldTitle) {
-        const cell = element.closest('.filename-cell');
-        const filenameSpan = cell.querySelector('.filename');
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.value = oldTitle;
-        input.style.width = '200px';
-        input.style.padding = '4px';
-        input.style.border = '1px solid #D2BFDD';
-        input.style.borderRadius = '4px';
-        input.style.marginRight = '8px';
-
-        const saveButton = document.createElement('button');
-        saveButton.textContent = 'Save';
-        saveButton.className = 'btn';
-        saveButton.style.padding = '4px 8px';
-        saveButton.style.fontSize = '12px';
-        saveButton.style.height = 'auto';
-
-        const cancelButton = document.createElement('button');
-        cancelButton.textContent = 'Cancel';
-        cancelButton.className = 'btn';
-        cancelButton.style.padding = '4px 8px';
-        cancelButton.style.fontSize = '12px';
-        cancelButton.style.height = 'auto';
-        cancelButton.style.marginLeft = '4px';
-
-        function restoreOriginal() {
-            cell.innerHTML = `
-                <span class="filename">${oldTitle}</span>
-                <span class="material-icons edit-icon" onclick="editTitle(this, '${oldTitle}')">edit</span>
-            `;
-        }
-
-        saveButton.onclick = () => {
-            const newTitle = input.value.trim();
-            if (!newTitle) {
-                alert('Title cannot be empty');
-                return;
-            }
-
-            fetch('/rename_transcript', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    old_title: oldTitle,
-                    new_title: newTitle
-                })
-            })
-            .then(response => {
-                if (!response.ok) {
-                    return response.json().then(data => {
-                        throw new Error(data.error || 'Rename failed');
-                    });
-                }
-                window.location.reload();
-            })
-            .catch(err => {
-                alert('Error renaming transcript: ' + err.message);
-                restoreOriginal();
-            });
-        };
-
-        cancelButton.onclick = restoreOriginal;
-
-        cell.innerHTML = '';
-        cell.appendChild(input);
-        cell.appendChild(saveButton);
-        cell.appendChild(cancelButton);
-        input.focus();
-        input.select();
-    }
-
-    function startCreating(title) {
-        // Redirect to create page with the transcript title
-        window.location.href = `/create?transcript=${encodeURIComponent(title)}`;
     }
 </script>
 {% endblock %}

@@ -7,7 +7,10 @@ import threading
 import multiprocessing
 import asyncio
 from concurrent.futures import ProcessPoolExecutor
-from datetime import timedelta
+from datetime import timedelta, datetime
+from enum import Enum
+from typing import Optional, Dict, Any
+import shutil
 
 import pysrt
 from dotenv import load_dotenv
@@ -39,6 +42,28 @@ from flask import (
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 from models import db, Transcript
+
+# Constants
+class TranscriptStatus(str, Enum):
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CHUNKING = "processing_chunking"
+    TRANSCRIBING = "processing_transcribing"
+    EXTRACTING_AUDIO = "processing_extracting_audio"
+    UPLOADING = "processing_uploading"
+
+def api_response(success: bool, data: Optional[Dict[str, Any]] = None, error: Optional[str] = None) -> Dict[str, Any]:
+    """Generate a standardized API response"""
+    response = {
+        "success": success,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    if data is not None:
+        response["data"] = data
+    if error is not None:
+        response["error"] = error
+    return response
 
 app = Flask(__name__, static_url_path='/static', static_folder='static')
 
@@ -84,25 +109,56 @@ with app.app_context():
 
 # Allowed file extensions
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'wmv', 'mp3', 'wav', 'm4a', 'aac', 'flac'}
+MAX_FILE_AGE = timedelta(hours=24)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def timedelta_to_srt_time(td):
-    """Convert a timedelta to SubRipTime object"""
-    total_seconds = int(td.total_seconds())
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    milliseconds = td.microseconds // 1000
-    return pysrt.SubRipTime(hours=hours, minutes=minutes, seconds=seconds, milliseconds=milliseconds)
+def cleanup_old_files():
+    """Clean up files older than MAX_FILE_AGE"""
+    temp_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'temp')
+    current_time = datetime.now().timestamp()
+    
+    try:
+        for filename in os.listdir(temp_dir):
+            filepath = os.path.join(temp_dir, filename)
+            if os.path.isfile(filepath):
+                file_age = current_time - os.path.getctime(filepath)
+                if file_age > MAX_FILE_AGE.total_seconds():
+                    try:
+                        os.remove(filepath)
+                        logging.info(f"Cleaned up old file: {filepath}")
+                    except Exception as e:
+                        logging.error(f"Error removing old file {filepath}: {str(e)}")
+    except Exception as e:
+        logging.error(f"Error during cleanup: {str(e)}")
+
+def cleanup_files(*files):
+    """Clean up temporary files"""
+    for file in files:
+        if file and os.path.exists(file):
+            try:
+                os.remove(file)
+                logging.info(f"Cleaned up file: {file}")
+            except Exception as e:
+                logging.error(f"Error cleaning up file {file}: {str(e)}")
 
 async def extract_audio(video_path, audio_path, progress_callback=None):
     """Extract audio from video file using ffmpeg"""
     try:
+        # Check if input file exists
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        # Check available disk space
+        free_space = os.statvfs(os.path.dirname(audio_path)).f_frsize * os.statvfs(os.path.dirname(audio_path)).f_bavail
+        video_size = os.path.getsize(video_path)
+        if free_space < video_size * 2:  # Ensure we have at least 2x the video size available
+            raise OSError("Insufficient disk space for audio extraction")
+
         if progress_callback:
             await progress_callback({
-                'stage': 'extracting_audio',
+                'stage': TranscriptStatus.EXTRACTING_AUDIO,
                 'progress': 10,
                 'text': 'Extracting audio from video...'
             })
@@ -131,7 +187,7 @@ async def extract_audio(video_path, audio_path, progress_callback=None):
 
         if progress_callback:
             await progress_callback({
-                'stage': 'audio_extracted',
+                'stage': TranscriptStatus.EXTRACTING_AUDIO,
                 'progress': 20,
                 'text': 'Audio extraction complete'
             })
@@ -142,19 +198,25 @@ async def extract_audio(video_path, audio_path, progress_callback=None):
         logging.error(f"Error extracting audio: {str(e)}")
         raise
 
-def cleanup_files(*files):
-    """Clean up temporary files"""
-    for file in files:
-        if file and os.path.exists(file):
-            try:
-                os.remove(file)
-                logging.info(f"Cleaned up file: {file}")
-            except Exception as e:
-                logging.error(f"Error cleaning up file {file}: {str(e)}")
-
 @app.route('/', methods=['GET'])
 def index():
-    return redirect(url_for('transcribe'))
+    cleanup_old_files()  # Clean up old files on index page load
+    transcripts = []
+    try:
+        for filename in os.listdir(os.path.join(app.config['UPLOAD_FOLDER'], 'temp')):
+            if filename.endswith('.json'):
+                transcripts.append({
+                    'title': filename[:-5],  # Remove .json extension
+                    'date': datetime.fromtimestamp(
+                        os.path.getmtime(os.path.join(app.config['UPLOAD_FOLDER'], 'temp', filename))
+                    ).strftime('%Y-%m-%d %H:%M:%S')
+                })
+        transcripts.sort(key=lambda x: x['date'], reverse=True)
+    except Exception as e:
+        logging.error(f"Error loading transcripts: {str(e)}")
+        return api_response(False, error="Error loading transcripts")
+    
+    return render_template('index.html', transcripts=transcripts)
 
 @app.route('/transcribe', methods=['GET'])
 def transcribe():
@@ -170,7 +232,7 @@ def schedule():
     return render_template('schedule.html', active_page='schedule')
 
 @app.route('/word_count/<title>')
-def get_word_count(title):
+async def get_word_count(title):
     try:
         # Use case-insensitive comparison for title
         transcript = Transcript.query.filter(
@@ -182,16 +244,13 @@ def get_word_count(title):
             # List all transcript titles for debugging
             all_titles = [t.title for t in Transcript.query.all()]
             logging.info(f"Available transcripts: {all_titles}")
-            return jsonify({
-                'error': 'Transcript not found',
-                'status': 'error'
-            }), 404
+            return api_response(False, error='Transcript not found', status=404)
 
         logging.info(f"Found transcript: {transcript.title} with status {transcript.status}")
         
         # Estimate duration based on file size if processing
         estimated_duration = None
-        if transcript.status == 'processing':
+        if transcript.status.startswith(TranscriptStatus.PROCESSING):
             # Try to find the file using original extension first
             original_ext = os.path.splitext(transcript.original_filename)[1] if transcript.original_filename else '.wav'
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], 'temp', secure_filename(title + original_ext))
@@ -209,35 +268,33 @@ def get_word_count(title):
             else:
                 estimated_duration = 7200  # 2 hours default
         
-        # Return status along with word count and duration estimate
-        return jsonify({
+        return api_response(True, data={
             'word_count': transcript.word_count,
             'status': transcript.status,
-            'error': None if transcript.status != 'failed' else transcript.error_message or 'Transcription failed',
+            'error': None if not transcript.status == TranscriptStatus.FAILED else transcript.error_message,
             'estimated_duration': estimated_duration
         })
     except Exception as e:
         error_msg = f"Error getting word count: {str(e)}"
         logging.error(error_msg)
-        return jsonify({
-            'word_count': 0,
-            'status': 'error',
-            'error': error_msg
-        }), 500
+        return api_response(False, error=error_msg, status=500)
 
 @app.route('/preview_transcript/<title>')
 def preview_transcript(title):
     try:
         transcript = Transcript.query.filter_by(title=title).first()
         if not transcript:
-            return jsonify({'error': 'Transcript not found'}), 404
+            return jsonify(api_response(False, error='Transcript not found')), 404
 
         # Format content with paragraphs
         formatted_content = '<p>' + '</p><p>'.join(transcript.content.split('\n\n')) + '</p>'
-        return jsonify({'content': formatted_content})
+        return jsonify(api_response(True, {
+            'content': formatted_content,
+            'title': title
+        }))
     except Exception as e:
         logging.error(f"Error getting preview: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify(api_response(False, error=str(e))), 500
 
 @app.route('/rename_transcript', methods=['POST'])
 def rename_transcript():
@@ -247,160 +304,154 @@ def rename_transcript():
         new_title = data.get('new_title')
         
         if not old_title or not new_title:
-            return jsonify({'error': 'Missing title'}), 400
+            return jsonify(api_response(False, error='Missing title')), 400
 
         # Check if new title already exists
         if Transcript.query.filter_by(title=new_title).first():
-            return jsonify({'error': 'Transcript with new title already exists'}), 400
+            return jsonify(api_response(False, error='Transcript with new title already exists')), 400
 
         # Update database record
         transcript = Transcript.query.filter_by(title=old_title).first()
         if not transcript:
-            return jsonify({'error': 'Original transcript not found'}), 404
+            return jsonify(api_response(False, error='Original transcript not found')), 404
 
         # Update database
         transcript.title = new_title
         db.session.commit()
         
-        return jsonify({'success': True})
+        return jsonify(api_response(True))
     except Exception as e:
         logging.error(f"Error renaming transcript: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify(api_response(False, error=str(e))), 500
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    
-    file = request.files['file']
-    if not file or file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'File type not allowed'}), 400
-
-    filename = secure_filename(file.filename)
-    title = os.path.splitext(filename)[0]
-    
-    # Check if transcript with this title already exists
-    if Transcript.query.filter_by(title=title).first():
-        return jsonify({'error': 'A transcript with this name already exists'}), 400
-
-    # Create temporary directory for processing
-    temp_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'temp')
-    os.makedirs(temp_dir, exist_ok=True)
-    temp_path = os.path.join(temp_dir, filename)
+async def process_file(file_path: str, title: str) -> None:
+    """Process an uploaded file for transcription"""
+    audio_path = None
+    temp_chunks_dir = None
     
     try:
-        # Clean the title (remove extension and special characters)
-        clean_title = ''.join(c for c in title if c.isalnum() or c in ' -_')
-        
-        # Create transcript record
+        # Initialize progress
         transcript = Transcript(
-            title=clean_title,
-            content='',  # Will be updated after processing
-            word_count=0,  # Will be updated after processing
-            status='processing',
-            error_message=None,
-            original_filename=filename
+            title=title,
+            status=TranscriptStatus.PROCESSING,
+            created_at=datetime.utcnow()
         )
         db.session.add(transcript)
         db.session.commit()
         
-        # Save uploaded file
-        file.save(temp_path)
+        # Create temporary directory for audio processing
+        temp_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'temp')
+        os.makedirs(temp_dir, exist_ok=True)
         
-        # Start transcription process
-        def process_file():
-            try:
-                # Create new event loop for this thread
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                async def process_async():
-                    async def update_progress(progress_data):
-                        """Update transcript progress in database"""
-                        transcript.status = f"processing_{progress_data['stage']}"
-                        if 'progress' in progress_data:
-                            transcript.progress = progress_data['progress']
-                        if 'text' in progress_data:
-                            transcript.content = progress_data['text']
-                        db.session.commit()
-
-                    audio_path = None
-                    try:
-                        # For video files, extract audio first
-                        if file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.wmv')):
-                            audio_path = os.path.join(temp_dir, f"{title}.wav")
-                            logging.info(f"Extracting audio from video file to {audio_path}")
-                            await extract_audio(temp_path, audio_path, update_progress)
-                            input_path = audio_path
-                        else:
-                            input_path = temp_path
-
-                        # Initialize transcription service
-                        async with GroqTranscriptionService() as service:
-                            # Transcribe the file
-                            result = await service.transcribe_audio(input_path, update_progress)
-                            
-                            # Update transcript with results
-                            transcript.content = result['text']
-                            transcript.word_count = len(result['text'].split())
-                            transcript.duration = result['duration']
-                            transcript.segments = [{
-                                'index': i,
-                                'start': segment['start'],
-                                'end': segment['end'],
-                                'text': segment['text'].strip()
-                            } for i, segment in enumerate(result['segments'], 1)]
-                            transcript.status = 'completed'
-                            db.session.commit()
-                            logging.info(f"Transcription completed for {clean_title}")
-
-                    except Exception as e:
-                        logging.error(f"Error in async processing: {str(e)}")
-                        transcript.status = 'failed'
-                        transcript.error_message = str(e)
-                        db.session.commit()
-                        raise
-                    finally:
-                        # Clean up temporary files
-                        cleanup_files(temp_path, audio_path)
-
-                try:
-                    # Run the async process
-                    loop.run_until_complete(process_async())
-                except Exception as e:
-                    logging.error(f"Error in process_file: {str(e)}")
-                    # Error is already handled in process_async
-                finally:
-                    try:
-                        # Clean up the event loop
-                        if not loop.is_closed():
-                            loop.stop()
-                            loop.close()
-                    except Exception as e:
-                        logging.error(f"Error closing event loop: {str(e)}")
-
-            except Exception as e:
-                logging.error(f"Error in process_file: {str(e)}")
-                transcript.status = 'failed'
-                transcript.error_message = str(e)
-                db.session.commit()
-
-        # Start processing in a separate thread
-        thread = threading.Thread(target=process_file)
-        thread.start()
+        # Extract audio if needed
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if file_ext not in ['.mp3', '.wav', '.m4a', '.aac', '.flac']:
+            audio_path = os.path.join(temp_dir, f"{title}_audio.wav")
+            success = await extract_audio(
+                file_path, 
+                audio_path,
+                lambda status, progress, error=None: update_transcript_status(title, status, progress, error)
+            )
+            if not success:
+                raise RuntimeError("Failed to extract audio from file")
+        else:
+            audio_path = file_path
+            
+        # Initialize transcription service
+        transcription_service = GroqTranscriptionService(
+            api_key=os.getenv('GROQ_API_KEY'),
+            openai_api_key=os.getenv('OPENAI_API_KEY')
+        )
         
-        return jsonify({
-            'title': clean_title,
-            'message': 'File uploaded successfully, processing started'
-        })
+        # Update status to transcribing
+        transcript.status = TranscriptStatus.TRANSCRIBING
+        db.session.commit()
+        
+        # Transcribe audio
+        result = await transcription_service.transcribe_audio(
+            audio_path,
+            lambda status, progress: update_transcript_status(title, status, progress)
+        )
+        
+        # Save transcription result
+        transcript.content = result['text']
+        transcript.segments = result.get('segments', [])
+        transcript.language = result.get('language', 'en')
+        transcript.duration = result.get('duration', 0)
+        transcript.word_count = len(result['text'].split())
+        transcript.status = TranscriptStatus.COMPLETED
+        db.session.commit()
         
     except Exception as e:
-        logging.error(f"Error handling upload: {str(e)}")
-        cleanup_files(temp_path)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error processing file: {str(e)}")
+        try:
+            transcript = Transcript.query.filter_by(title=title).first()
+            if transcript:
+                transcript.status = TranscriptStatus.FAILED
+                transcript.error = str(e)
+                db.session.commit()
+        except Exception as db_error:
+            logger.error(f"Error updating transcript status: {str(db_error)}")
+    
+    finally:
+        # Cleanup temporary files
+        cleanup_files(file_path)
+        if audio_path and audio_path != file_path:
+            cleanup_files(audio_path)
+        if temp_chunks_dir:
+            shutil.rmtree(temp_chunks_dir, ignore_errors=True)
+
+def update_transcript_status(title: str, status: TranscriptStatus, progress: float = 0, error: Optional[str] = None) -> None:
+    """Update the status and progress of a transcript"""
+    try:
+        transcript = Transcript.query.filter_by(title=title).first()
+        if transcript:
+            transcript.status = status
+            transcript.progress = progress
+            if error:
+                transcript.error = error
+            db.session.commit()
+    except Exception as e:
+        logger.error(f"Error updating transcript status: {str(e)}")
+
+@app.route('/upload', methods=['POST'])
+async def upload_file():
+    if 'file' not in request.files:
+        return jsonify(api_response(False, error="No file provided"))
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify(api_response(False, error="No file selected"))
+    
+    if not allowed_file(file.filename):
+        return jsonify(api_response(False, error="File type not allowed"))
+    
+    try:
+        # Save uploaded file
+        filename = secure_filename(file.filename)
+        title = os.path.splitext(filename)[0]
+        
+        # Check if transcript exists
+        if Transcript.query.filter_by(title=title).first():
+            return jsonify(api_response(False, error="A transcript with this name already exists"))
+        
+        # Save file
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        # Start processing in background
+        asyncio.create_task(process_file(file_path, title))
+        
+        # Return success response
+        return jsonify(api_response(True, {
+            "title": title,
+            "size": os.path.getsize(file_path),
+            "type": file.content_type
+        }))
+        
+    except Exception as e:
+        logger.error(f"Error handling upload: {str(e)}")
+        return jsonify(api_response(False, error=str(e)))
 
 @app.route('/transcript/<int:transcript_id>', methods=['GET'])
 def get_transcript(transcript_id):
